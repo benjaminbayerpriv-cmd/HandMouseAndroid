@@ -335,14 +335,8 @@ public class HandMouseAccessibilityService extends AccessibilityService {
             }
 
             if (leftDragging && strokeActive) {
-                // Der echte gedrückte Android-Finger soll der Maus folgen.
                 desiredX = cursorX;
                 desiredY = cursorY;
-
-                // Falls gerade kein Segment unterwegs ist, sofort weiterziehen.
-                if (!segmentRunning) {
-                    dispatchNextSegment();
-                }
             }
 
             return;
@@ -435,7 +429,7 @@ public class HandMouseAccessibilityService extends AccessibilityService {
         Path p = new Path();
         p.moveTo(strokeEndX, strokeEndY);
 
-        long firstDuration = "right".equals(mode) ? 550L : 16L;
+        long firstDuration = "right".equals(mode) ? 550L : 75L;
         stroke = new GestureDescription.StrokeDescription(p, 0, firstDuration, true);
         dispatchSegment(stroke);
     }
@@ -457,7 +451,7 @@ public class HandMouseAccessibilityService extends AccessibilityService {
         p.lineTo(desiredX, desiredY);
 
         boolean keep = strokeHeld;
-        long duration = keep ? 16L : 1L;
+        long duration = keep ? 55L : 1L;
 
         try {
             stroke = stroke.continueStroke(p, 0, duration, keep);
