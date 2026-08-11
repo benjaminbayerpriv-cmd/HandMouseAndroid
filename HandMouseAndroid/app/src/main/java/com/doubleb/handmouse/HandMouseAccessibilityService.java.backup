@@ -49,15 +49,6 @@ public class HandMouseAccessibilityService extends AccessibilityService {
     private float desiredY;
     private String pendingMode = "none";
 
-    // Left click is NOT pressed immediately.
-    // Short pinch = tap on release. Hold = real drag.
-    private boolean leftPending = false;
-    private boolean leftDragging = false;
-    private long leftStartedAt = 0L;
-    private float leftStartX = 0f;
-    private float leftStartY = 0f;
-    private static final long LEFT_DRAG_HOLD_MS = 260L;
-
     public static HandMouseAccessibilityService getInstance() { return instance; }
     public boolean isTracking() { return webEngineRunning; }
     public String getDiagnosticStatus() { return diagnosticStatus; }
@@ -283,7 +274,6 @@ public class HandMouseAccessibilityService extends AccessibilityService {
         nx = clamp(nx, 0f, 1f);
         ny = clamp(ny, 0f, 1f);
 
-        // Cursor always follows the hand except during fist.
         if (!"fist".equals(g)) {
             cursorX = nx * screenW;
             cursorY = ny * screenH;
@@ -294,118 +284,24 @@ public class HandMouseAccessibilityService extends AccessibilityService {
 
         if (cursor != null) cursor.setMode(g);
 
-        String previous = gesture;
-
-        // ---------- LEFT CLICK / DRAG ----------
-        if ("left".equals(g)) {
-
-            if (!"left".equals(previous)) {
-                // Finish another gesture first.
-                if ("right".equals(previous)) {
-                    endStroke();
-                }
-
-                leftPending = true;
-                leftDragging = false;
-                leftStartedAt = android.os.SystemClock.uptimeMillis();
-                leftStartX = cursorX;
-                leftStartY = cursorY;
-            }
-
-            gesture = "left";
-
-            if (!leftDragging) {
-                long held = android.os.SystemClock.uptimeMillis() - leftStartedAt;
-
-                float dx = cursorX - leftStartX;
-                float dy = cursorY - leftStartY;
-                float moved = (float)Math.hypot(dx, dy);
-
-                // A little movement alone must NOT instantly become drag.
-                boolean intentionalMove =
-                        held >= 120L && moved >= dp(30);
-
-                if (held >= LEFT_DRAG_HOLD_MS || intentionalMove) {
-                    leftDragging = true;
-                    leftPending = false;
-
-                    // Touch-down begins only NOW.
-                    beginStroke("left");
-                }
-            }
-
-            if (leftDragging && strokeActive) {
-                desiredX = cursorX;
-                desiredY = cursorY;
-            }
-
+        if ("fist".equals(g) || "none".equals(g)) {
+            if (!"none".equals(gesture)) endStroke();
+            gesture = g;
             return;
         }
 
-        // LEFT was released.
-        if ("left".equals(previous)) {
-
-            if (leftDragging) {
-                // Guaranteed ACTION_UP / final non-continuing stroke.
+        if (!g.equals(gesture)) {
+            if (!"none".equals(gesture) && !"fist".equals(gesture)) {
+                pendingMode = g;
                 endStroke();
-            } else if (leftPending) {
-                // Important: tap where the cursor is NOW,
-                // not where the pinch originally started.
-                dispatchTap(cursorX, cursorY);
+            } else {
+                beginStroke(g);
             }
-
-            leftPending = false;
-            leftDragging = false;
-            leftStartedAt = 0L;
+            gesture = g;
+        } else if (strokeActive) {
+            desiredX = cursorX;
+            desiredY = cursorY;
         }
-
-        // ---------- FIST ----------
-        if ("fist".equals(g)) {
-            if ("right".equals(previous)) endStroke();
-
-            gesture = "fist";
-            return;
-        }
-
-        // ---------- RIGHT ----------
-        if ("right".equals(g)) {
-            if (!"right".equals(previous)) {
-                beginStroke("right");
-            } else if (strokeActive) {
-                desiredX = cursorX;
-                desiredY = cursorY;
-            }
-
-            gesture = "right";
-            return;
-        }
-
-        // ---------- NONE ----------
-        if ("right".equals(previous)) {
-            endStroke();
-        }
-
-        gesture = "none";
-    }
-
-    private void dispatchTap(float x, float y) {
-        Path p = new Path();
-        p.moveTo(x, y);
-
-        GestureDescription.StrokeDescription tap =
-                new GestureDescription.StrokeDescription(
-                        p,
-                        0,
-                        55,
-                        false
-                );
-
-        GestureDescription gd =
-                new GestureDescription.Builder()
-                        .addStroke(tap)
-                        .build();
-
-        dispatchGesture(gd, null, null);
     }
 
     private void moveCursorOverlay() {
@@ -464,48 +360,34 @@ public class HandMouseAccessibilityService extends AccessibilityService {
     }
 
     private void dispatchSegment(GestureDescription.StrokeDescription part) {
-        GestureDescription gd =
-                new GestureDescription.Builder()
-                        .addStroke(part)
-                        .build();
-
+        GestureDescription gd = new GestureDescription.Builder().addStroke(part).build();
         segmentRunning = true;
 
-        boolean accepted = dispatchGesture(
-                gd,
-                new GestureResultCallback() {
-                    @Override
-                    public void onCompleted(GestureDescription gestureDescription) {
-                        main.post(() -> {
-                            segmentRunning = false;
+        boolean accepted = dispatchGesture(gd, new GestureResultCallback() {
+            @Override
+            public void onCompleted(GestureDescription gestureDescription) {
+                main.post(() -> {
+                    segmentRunning = false;
+                    if (!strokeActive) return;
 
-                            if (!strokeActive) return;
-
-                            // If THIS segment was the final one,
-                            // the virtual finger is definitely up.
-                            if (!part.willContinue()) {
-                                clearStroke();
-                                startPendingIfAny();
-                                return;
-                            }
-
-                            // Continue either as another held segment
-                            // or as the final release segment.
-                            dispatchNextSegment();
-                        });
+                    if (!strokeHeld && !stroke.willContinue()) {
+                        clearStroke();
+                        startPendingIfAny();
+                    } else {
+                        dispatchNextSegment();
                     }
+                });
+            }
 
-                    @Override
-                    public void onCancelled(GestureDescription gestureDescription) {
-                        main.post(() -> {
-                            segmentRunning = false;
-                            clearStroke();
-                            startPendingIfAny();
-                        });
-                    }
-                },
-                null
-        );
+            @Override
+            public void onCancelled(GestureDescription gestureDescription) {
+                main.post(() -> {
+                    segmentRunning = false;
+                    clearStroke();
+                    startPendingIfAny();
+                });
+            }
+        }, null);
 
         if (!accepted) {
             segmentRunning = false;
