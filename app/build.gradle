@@ -4,7 +4,7 @@ plugins {
 
 android {
     namespace 'com.doubleb.handmouse'
-    compileSdk 37
+    compileSdk 36
 
     defaultConfig {
         applicationId 'com.doubleb.handmouse'
