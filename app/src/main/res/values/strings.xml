@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Hand Mouse</string>
+    <string name="accessibility_service_label">Hand Mouse Steuerung</string>
+    <string name="accessibility_service_description">Steuert Android per Handgesten mit einem sichtbaren System-Cursor.</string>
+</resources>
