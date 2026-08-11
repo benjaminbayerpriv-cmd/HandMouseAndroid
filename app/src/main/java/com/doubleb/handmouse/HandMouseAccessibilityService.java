@@ -33,10 +33,10 @@ public class HandMouseAccessibilityService extends AccessibilityService implemen
     private long pinchStartMs;
     private float pinchStartX, pinchStartY;
     private boolean dragActive;
-    private static final long LEFT_DRAG_HOLD_MS = 180L;
-    private static final long RIGHT_DRAG_HOLD_MS = 360L;
-    private static final float DRAG_MOVE_THRESHOLD_DP = 8f;
-    private static final long RELEASE_GRACE_MS = 95L;
+    private static final long LEFT_DRAG_HOLD_MS = 300L;
+    private static final long RIGHT_DRAG_HOLD_MS = 520L;
+    private static final float DRAG_MOVE_THRESHOLD_DP = 18f;
+    private static final long RELEASE_GRACE_MS = 85L;
 
     // Continued accessibility drag state.
     private GestureDescription.StrokeDescription stroke;

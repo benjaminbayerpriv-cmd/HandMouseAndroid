@@ -50,6 +50,19 @@ public class HandTrackingService extends LifecycleService {
     private HandLandmarker handLandmarker;
     private long lastTimestamp;
     private String currentGesture = "none";
+    private String pinchCandidate = "none";
+    private int pinchCandidateFrames;
+    private int pinchReleaseFrames;
+
+    // Strict pinch hysteresis. Enter is intentionally much tighter than release.
+    private static final float LEFT_ENTER = 0.24f;
+    private static final float LEFT_RELEASE = 0.34f;
+    private static final float RIGHT_ENTER = 0.23f;
+    private static final float RIGHT_RELEASE = 0.34f;
+    private static final float RIGHT_INDEX_CLEAR_ENTER = 0.46f;
+    private static final float RIGHT_INDEX_CLEAR_RELEASE = 0.36f;
+    private static final int PINCH_ENTER_FRAMES = 3;
+    private static final int PINCH_RELEASE_FRAMES = 2;
     private boolean fistLatched;
     private int fistReleaseFrames;
     private float smoothX = 0.5f, smoothY = 0.5f;
@@ -164,13 +177,67 @@ public class HandTrackingService extends LifecycleService {
     }
 
     private String gesture(List<NormalizedLandmark> lm) {
-        if (isFullFist(lm)) return "fist";
+        if (isFullFist(lm)) {
+            pinchCandidate = "none";
+            pinchCandidateFrames = 0;
+            pinchReleaseFrames = 0;
+            return "fist";
+        }
+
         float scale = Math.max(dist(lm,5,17), Math.max(dist(lm,0,9), 0.05f));
         float ti = dist(lm,4,8) / scale;
         float tm = dist(lm,4,12) / scale;
-        float threshold = "none".equals(currentGesture) ? 0.38f : 0.48f;
-        if (tm < threshold && ti > threshold * 1.35f) return "right";
-        if (ti < threshold) return "left";
+
+        // Once a pinch is active, keep it with a wider RELEASE threshold.
+        // This prevents flicker without making initial activation too easy.
+        if ("left".equals(currentGesture)) {
+            if (ti <= LEFT_RELEASE) {
+                pinchReleaseFrames = 0;
+                return "left";
+            }
+            if (++pinchReleaseFrames < PINCH_RELEASE_FRAMES) return "left";
+            pinchReleaseFrames = 0;
+            pinchCandidate = "none";
+            pinchCandidateFrames = 0;
+            return "none";
+        }
+
+        if ("right".equals(currentGesture)) {
+            if (tm <= RIGHT_RELEASE && ti >= RIGHT_INDEX_CLEAR_RELEASE) {
+                pinchReleaseFrames = 0;
+                return "right";
+            }
+            if (++pinchReleaseFrames < PINCH_RELEASE_FRAMES) return "right";
+            pinchReleaseFrames = 0;
+            pinchCandidate = "none";
+            pinchCandidateFrames = 0;
+            return "none";
+        }
+
+        // New gestures require three consecutive confident frames.
+        // Right pinch is checked first and explicitly requires the index finger away.
+        String raw = "none";
+        if (tm <= RIGHT_ENTER && ti >= RIGHT_INDEX_CLEAR_ENTER) raw = "right";
+        else if (ti <= LEFT_ENTER) raw = "left";
+
+        if ("none".equals(raw)) {
+            pinchCandidate = "none";
+            pinchCandidateFrames = 0;
+            return "none";
+        }
+
+        if (raw.equals(pinchCandidate)) pinchCandidateFrames++;
+        else {
+            pinchCandidate = raw;
+            pinchCandidateFrames = 1;
+        }
+
+        if (pinchCandidateFrames >= PINCH_ENTER_FRAMES) {
+            pinchCandidate = "none";
+            pinchCandidateFrames = 0;
+            pinchReleaseFrames = 0;
+            return raw;
+        }
         return "none";
     }
 
