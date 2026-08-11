@@ -9,6 +9,7 @@ import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Matrix;
 import android.os.SystemClock;
+import android.util.Size;
 
 import androidx.annotation.NonNull;
 import androidx.camera.core.CameraSelector;
@@ -49,38 +50,41 @@ public class HandTrackingService extends LifecycleService {
     private ProcessCameraProvider cameraProvider;
     private HandLandmarker handLandmarker;
     private long lastTimestamp;
+
     private String currentGesture = "none";
     private String pinchCandidate = "none";
     private int pinchCandidateFrames;
     private int pinchReleaseFrames;
 
-    // Strict pinch hysteresis. Enter is intentionally much tighter than release.
-    private static final float LEFT_ENTER = 0.24f;
-    private static final float LEFT_RELEASE = 0.34f;
-    private static final float RIGHT_ENTER = 0.23f;
-    private static final float RIGHT_RELEASE = 0.34f;
-    private static final float RIGHT_INDEX_CLEAR_ENTER = 0.46f;
-    private static final float RIGHT_INDEX_CLEAR_RELEASE = 0.36f;
-    private static final int PINCH_ENTER_FRAMES = 3;
+    // Tight activation, looser release. Two frames keeps latency low without accidental activation.
+    private static final float LEFT_ENTER = 0.205f;
+    private static final float LEFT_RELEASE = 0.305f;
+    private static final float RIGHT_ENTER = 0.205f;
+    private static final float RIGHT_RELEASE = 0.305f;
+    private static final float RIGHT_INDEX_CLEAR_ENTER = 0.49f;
+    private static final float RIGHT_INDEX_CLEAR_RELEASE = 0.38f;
+    private static final int PINCH_ENTER_FRAMES = 2;
     private static final int PINCH_RELEASE_FRAMES = 2;
+
     private boolean fistLatched;
     private int fistReleaseFrames;
+
+    // Only a tiny one-pole filter. v4 had two heavy smoothing stages and felt delayed.
     private float smoothX = 0.5f, smoothY = 0.5f;
     private boolean haveSmooth;
+    private static final float TRACKING_ALPHA = 0.90f;
 
     public static void setListener(Listener l) { listener = l; }
     public static boolean isRunning() { return running; }
     public static String getStatus() { return status; }
 
-    @Override
-    public void onCreate() {
+    @Override public void onCreate() {
         super.onCreate();
         cameraExecutor = Executors.newSingleThreadExecutor();
         createChannel();
     }
 
-    @Override
-    public int onStartCommand(Intent intent, int flags, int startId) {
+    @Override public int onStartCommand(Intent intent, int flags, int startId) {
         super.onStartCommand(intent, flags, startId);
         startForeground(NOTIFICATION_ID, notification("Kamera wird gestartet …"));
         if (!running) startNativeTracking();
@@ -100,9 +104,9 @@ public class HandTrackingService extends LifecycleService {
                     .setBaseOptions(base)
                     .setRunningMode(RunningMode.LIVE_STREAM)
                     .setNumHands(1)
-                    .setMinHandDetectionConfidence(0.45f)
-                    .setMinHandPresenceConfidence(0.45f)
-                    .setMinTrackingConfidence(0.45f)
+                    .setMinHandDetectionConfidence(0.42f)
+                    .setMinHandPresenceConfidence(0.42f)
+                    .setMinTrackingConfidence(0.42f)
                     .setResultListener(this::onResult)
                     .setErrorListener(e -> setStatus("MediaPipe-Fehler: " + e.getMessage()))
                     .build();
@@ -121,6 +125,7 @@ public class HandTrackingService extends LifecycleService {
             try {
                 cameraProvider = future.get();
                 ImageAnalysis analysis = new ImageAnalysis.Builder()
+                        .setTargetResolution(new Size(640, 480))
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                         .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                         .build();
@@ -128,9 +133,9 @@ public class HandTrackingService extends LifecycleService {
                 cameraProvider.unbindAll();
                 cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, analysis);
                 running = true;
-                setStatus("Kamera aktiv – zeig deine Hand");
+                setStatus("Kamera aktiv – Low-Latency Tracking");
                 NotificationManager nm = getSystemService(NotificationManager.class);
-                nm.notify(NOTIFICATION_ID, notification("Kamera + Handtracking aktiv"));
+                nm.notify(NOTIFICATION_ID, notification("Handtracking aktiv"));
             } catch (Throwable t) {
                 setStatus("Kamera-Fehler: " + t.getMessage());
                 stopSelf();
@@ -160,16 +165,24 @@ public class HandTrackingService extends LifecycleService {
 
     private void onResult(HandLandmarkerResult result, MPImage image) {
         if (result.landmarks().isEmpty()) {
-            currentGesture = "none";
             sendFrame(smoothX, smoothY, "none");
             setStatus("Kamera aktiv – keine Hand erkannt");
             return;
         }
+
         List<NormalizedLandmark> lm = result.landmarks().get(0);
+
+        // Cursor anchor is EXACTLY the midpoint between thumb tip (4) and index tip (8).
         float x = (lm.get(4).x() + lm.get(8).x()) * 0.5f;
         float y = (lm.get(4).y() + lm.get(8).y()) * 0.5f;
-        if (!haveSmooth) { smoothX = x; smoothY = y; haveSmooth = true; }
-        else { smoothX += (x - smoothX) * 0.62f; smoothY += (y - smoothY) * 0.62f; }
+
+        if (!haveSmooth) {
+            smoothX = x; smoothY = y; haveSmooth = true;
+        } else {
+            smoothX += (x - smoothX) * TRACKING_ALPHA;
+            smoothY += (y - smoothY) * TRACKING_ALPHA;
+        }
+
         String g = gesture(lm);
         currentGesture = g;
         sendFrame(smoothX, smoothY, g);
@@ -184,12 +197,10 @@ public class HandTrackingService extends LifecycleService {
             return "fist";
         }
 
-        float scale = Math.max(dist(lm,5,17), Math.max(dist(lm,0,9), 0.05f));
-        float ti = dist(lm,4,8) / scale;
-        float tm = dist(lm,4,12) / scale;
+        float scale = Math.max(dist(lm, 5, 17), Math.max(dist(lm, 0, 9), 0.05f));
+        float ti = dist(lm, 4, 8) / scale;
+        float tm = dist(lm, 4, 12) / scale;
 
-        // Once a pinch is active, keep it with a wider RELEASE threshold.
-        // This prevents flicker without making initial activation too easy.
         if ("left".equals(currentGesture)) {
             if (ti <= LEFT_RELEASE) {
                 pinchReleaseFrames = 0;
@@ -197,8 +208,6 @@ public class HandTrackingService extends LifecycleService {
             }
             if (++pinchReleaseFrames < PINCH_RELEASE_FRAMES) return "left";
             pinchReleaseFrames = 0;
-            pinchCandidate = "none";
-            pinchCandidateFrames = 0;
             return "none";
         }
 
@@ -209,13 +218,9 @@ public class HandTrackingService extends LifecycleService {
             }
             if (++pinchReleaseFrames < PINCH_RELEASE_FRAMES) return "right";
             pinchReleaseFrames = 0;
-            pinchCandidate = "none";
-            pinchCandidateFrames = 0;
             return "none";
         }
 
-        // New gestures require three consecutive confident frames.
-        // Right pinch is checked first and explicitly requires the index finger away.
         String raw = "none";
         if (tm <= RIGHT_ENTER && ti >= RIGHT_INDEX_CLEAR_ENTER) raw = "right";
         else if (ti <= LEFT_ENTER) raw = "left";
@@ -227,10 +232,7 @@ public class HandTrackingService extends LifecycleService {
         }
 
         if (raw.equals(pinchCandidate)) pinchCandidateFrames++;
-        else {
-            pinchCandidate = raw;
-            pinchCandidateFrames = 1;
-        }
+        else { pinchCandidate = raw; pinchCandidateFrames = 1; }
 
         if (pinchCandidateFrames >= PINCH_ENTER_FRAMES) {
             pinchCandidate = "none";
@@ -247,9 +249,9 @@ public class HandTrackingService extends LifecycleService {
         float avg = (s1+s2+s3+s4)/4f;
         float score = Math.min(avg, min*1.08f);
         if (!fistLatched) {
-            if (score >= 0.72f) { fistLatched = true; fistReleaseFrames = 0; }
-        } else if (score < 0.48f) {
-            if (++fistReleaseFrames >= 5) { fistLatched = false; fistReleaseFrames = 0; }
+            if (score >= 0.76f) { fistLatched = true; fistReleaseFrames = 0; }
+        } else if (score < 0.50f) {
+            if (++fistReleaseFrames >= 4) { fistLatched = false; fistReleaseFrames = 0; }
         } else fistReleaseFrames = 0;
         return fistLatched;
     }
@@ -268,18 +270,28 @@ public class HandTrackingService extends LifecycleService {
     }
 
     private float dist(List<NormalizedLandmark> lm,int a,int b) {
-        float dx=lm.get(a).x()-lm.get(b).x(), dy=lm.get(a).y()-lm.get(b).y(); return (float)Math.hypot(dx,dy);
+        float dx=lm.get(a).x()-lm.get(b).x(), dy=lm.get(a).y()-lm.get(b).y();
+        return (float)Math.hypot(dx,dy);
     }
     private float clamp(float v){ return Math.max(0f, Math.min(1f,v)); }
 
     private void sendFrame(float x,float y,String g){ Listener l=listener; if(l!=null) l.onTrackingFrame(x,y,g); }
     private void setStatus(String s){ status=s; Listener l=listener; if(l!=null) l.onTrackingStatus(s); }
 
-    private void createChannel(){ NotificationManager nm=getSystemService(NotificationManager.class); nm.createNotificationChannel(new NotificationChannel(CHANNEL,"Hand Mouse Kamera",NotificationManager.IMPORTANCE_LOW)); }
-    private Notification notification(String text){ return new NotificationCompat.Builder(this,CHANNEL).setSmallIcon(android.R.drawable.ic_menu_camera).setContentTitle("Hand Mouse").setContentText(text).setOngoing(true).build(); }
+    private void createChannel(){
+        NotificationManager nm=getSystemService(NotificationManager.class);
+        nm.createNotificationChannel(new NotificationChannel(CHANNEL,"Hand Mouse Kamera",NotificationManager.IMPORTANCE_LOW));
+    }
+    private Notification notification(String text){
+        return new NotificationCompat.Builder(this,CHANNEL)
+                .setSmallIcon(android.R.drawable.ic_menu_camera)
+                .setContentTitle("Hand Mouse")
+                .setContentText(text)
+                .setOngoing(true)
+                .build();
+    }
 
-    @Override
-    public void onDestroy() {
+    @Override public void onDestroy() {
         running=false;
         if(cameraProvider!=null) cameraProvider.unbindAll();
         if(handLandmarker!=null) try{ handLandmarker.close(); }catch(Exception ignored){}

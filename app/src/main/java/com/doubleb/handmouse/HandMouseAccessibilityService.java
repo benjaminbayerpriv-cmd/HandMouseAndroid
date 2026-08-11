@@ -4,12 +4,14 @@ import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.view.Gravity;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityNodeInfo;
 
 public class HandMouseAccessibilityService extends AccessibilityService implements HandTrackingService.Listener {
     private static volatile HandMouseAccessibilityService instance;
@@ -19,58 +21,37 @@ public class HandMouseAccessibilityService extends AccessibilityService implemen
     private CursorView cursor;
     private WindowManager.LayoutParams params;
     private int screenW, screenH;
-
-    // Tracking target and independently animated cursor position.
-    private float targetX, targetY;
     private float cursorX, cursorY;
-    private boolean animatorRunning;
-    private static final long ANIM_MS = 16L;          // ~60 Hz
-    private static final float CURSOR_EASE = 0.34f;  // smooth but responsive
-    private static final float TARGET_DEADZONE_PX = 1.4f;
 
-    // Pinch state machine.
-    private String activeMode = "none"; // none / left / right
+    // Camera active zone -> whole screen. This lets you hit screen edges without moving your hand out of frame.
+    private static final float ACTIVE_LEFT = 0.15f;
+    private static final float ACTIVE_RIGHT = 0.85f;
+    private static final float ACTIVE_TOP = 0.12f;
+    private static final float ACTIVE_BOTTOM = 0.84f;
+
+    // Input state. Tap occurs only on release. Drag begins only after intentional hold.
+    private String activeMode = "none";
     private long pinchStartMs;
-    private float pinchStartX, pinchStartY;
     private boolean dragActive;
-    private static final long LEFT_DRAG_HOLD_MS = 300L;
-    private static final long RIGHT_DRAG_HOLD_MS = 520L;
-    private static final float DRAG_MOVE_THRESHOLD_DP = 18f;
-    private static final long RELEASE_GRACE_MS = 85L;
+    private static final long LEFT_DRAG_HOLD_MS = 430L;
+    private static final long RIGHT_DRAG_HOLD_MS = 620L;
+    private static final long RELEASE_GRACE_MS = 45L;
 
-    // Continued accessibility drag state.
+    // Continued Android drag.
     private GestureDescription.StrokeDescription stroke;
     private boolean segmentRunning;
     private float strokeEndX, strokeEndY;
     private float desiredDragX, desiredDragY;
 
-    private final Runnable releaseRunnable = () -> finishPinch(false);
+    // Button aim assist cache.
+    private long lastAssistScanMs;
+    private float assistX, assistY;
+    private boolean assistValid;
+    private static final long ASSIST_SCAN_INTERVAL_MS = 80L;
+    private static final float ASSIST_RADIUS_DP = 86f;
+    private static final float ASSIST_STRONG_RADIUS_DP = 32f;
 
-    private final Runnable animator = new Runnable() {
-        @Override public void run() {
-            if (!animatorRunning) return;
-            float dx = targetX - cursorX;
-            float dy = targetY - cursorY;
-            float dist = (float)Math.hypot(dx, dy);
-            if (dist < 0.65f) {
-                cursorX = targetX;
-                cursorY = targetY;
-            } else {
-                // Slightly stronger catch-up for big movements, gentler for micro-jitter.
-                float boost = Math.min(0.22f, dist / Math.max(1f, screenW) * 1.7f);
-                float a = Math.min(0.62f, CURSOR_EASE + boost);
-                cursorX += dx * a;
-                cursorY += dy * a;
-            }
-            moveCursorOverlay();
-            if (dragActive) {
-                desiredDragX = cursorX;
-                desiredDragY = cursorY;
-            }
-            maybeStartHeldDrag();
-            main.postDelayed(this, ANIM_MS);
-        }
-    };
+    private final Runnable releaseRunnable = () -> finishPinch(false);
 
     public static HandMouseAccessibilityService getInstance() { return instance; }
 
@@ -80,16 +61,16 @@ public class HandMouseAccessibilityService extends AccessibilityService implemen
         wm = (WindowManager)getSystemService(WINDOW_SERVICE);
         createCursor();
         HandTrackingService.setListener(this);
-        animatorRunning = true;
-        main.post(animator);
     }
 
-    @Override public void onAccessibilityEvent(AccessibilityEvent e) {}
+    @Override public void onAccessibilityEvent(AccessibilityEvent e) {
+        // Invalidate cached target when UI changes.
+        assistValid = false;
+    }
+
     @Override public void onInterrupt() {}
 
     @Override public boolean onUnbind(android.content.Intent i) {
-        animatorRunning = false;
-        main.removeCallbacks(animator);
         main.removeCallbacks(releaseRunnable);
         cancelGestureImmediately();
         removeCursor();
@@ -102,8 +83,9 @@ public class HandMouseAccessibilityService extends AccessibilityService implemen
         android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
         screenW = dm.widthPixels;
         screenH = dm.heightPixels;
-        targetX = cursorX = screenW / 2f;
-        targetY = cursorY = screenH / 2f;
+        cursorX = screenW / 2f;
+        cursorY = screenH / 2f;
+
         cursor = new CursorView(this);
         int size = dp(38);
         params = new WindowManager.LayoutParams(
@@ -135,17 +117,23 @@ public class HandMouseAccessibilityService extends AccessibilityService implemen
     @Override public void onTrackingStatus(String s) {}
 
     private void handleFrame(float nx, float ny, String g) {
-        nx = Math.max(0f, Math.min(1f, nx));
-        ny = Math.max(0f, Math.min(1f, ny));
         if (g == null) g = "none";
 
-        float newX = nx * screenW;
-        float newY = ny * screenH;
+        // Higher sensitivity: 70% of camera width/72% height maps to 100% of display.
+        float mappedX = remap(nx, ACTIVE_LEFT, ACTIVE_RIGHT) * screenW;
+        float mappedY = remap(ny, ACTIVE_TOP, ACTIVE_BOTTOM) * screenH;
 
         if (!"fist".equals(g)) {
-            if (Math.hypot(newX - targetX, newY - targetY) >= TARGET_DEADZONE_PX) {
-                targetX = newX;
-                targetY = newY;
+            cursorX = mappedX;
+            cursorY = mappedY;
+
+            // Aim assist only when not dragging. It magnetically attracts nearby clickable elements.
+            if (!dragActive) applyAimAssist();
+
+            moveCursorOverlay();
+            if (dragActive) {
+                desiredDragX = cursorX;
+                desiredDragY = cursorY;
             }
         }
 
@@ -162,7 +150,6 @@ public class HandMouseAccessibilityService extends AccessibilityService implemen
             if ("none".equals(activeMode)) {
                 startPinch(g);
             } else if (!g.equals(activeMode)) {
-                // Gesture changed directly left<->right: finish old one, then begin new one.
                 finishPinch(true);
                 startPinch(g);
             }
@@ -170,18 +157,20 @@ public class HandMouseAccessibilityService extends AccessibilityService implemen
             return;
         }
 
-        // A 1-2 frame tracking dropout should not accidentally release a click/drag.
         if (!"none".equals(activeMode)) {
             main.removeCallbacks(releaseRunnable);
             main.postDelayed(releaseRunnable, RELEASE_GRACE_MS);
         }
     }
 
+    private float remap(float v, float lo, float hi) {
+        float t = (v - lo) / Math.max(0.001f, hi - lo);
+        return Math.max(0f, Math.min(1f, t));
+    }
+
     private void startPinch(String mode) {
         activeMode = mode;
         pinchStartMs = SystemClock.uptimeMillis();
-        pinchStartX = cursorX;
-        pinchStartY = cursorY;
         dragActive = false;
         clearStrokeState();
     }
@@ -189,11 +178,8 @@ public class HandMouseAccessibilityService extends AccessibilityService implemen
     private void maybeStartHeldDrag() {
         if ("none".equals(activeMode) || dragActive || segmentRunning) return;
         long held = SystemClock.uptimeMillis() - pinchStartMs;
-        float moved = (float)Math.hypot(cursorX - pinchStartX, cursorY - pinchStartY);
         long threshold = "right".equals(activeMode) ? RIGHT_DRAG_HOLD_MS : LEFT_DRAG_HOLD_MS;
-        if (held >= threshold || moved >= dpFloat(DRAG_MOVE_THRESHOLD_DP)) {
-            beginDrag(activeMode);
-        }
+        if (held >= threshold) beginDrag(activeMode);
     }
 
     private void finishPinch(boolean cancelTap) {
@@ -208,9 +194,12 @@ public class HandMouseAccessibilityService extends AccessibilityService implemen
         }
 
         if (!cancelTap) {
-            // Short pinch = one clean action on release. No continuous gesture was started.
-            if ("left".equals(mode)) dispatchTap(cursorX, cursorY);
-            else if ("right".equals(mode)) dispatchLongPress(cursorX, cursorY);
+            if ("left".equals(mode)) {
+                // Buttons are more reliable when clicked as accessibility nodes; fallback to physical tap.
+                if (!clickNearestClickable(cursorX, cursorY, dpFloat(64f))) dispatchTap(cursorX, cursorY);
+            } else if ("right".equals(mode)) {
+                dispatchLongPress(cursorX, cursorY);
+            }
         }
         clearStrokeState();
     }
@@ -218,14 +207,14 @@ public class HandMouseAccessibilityService extends AccessibilityService implemen
     private void dispatchTap(float x, float y) {
         Path p = new Path();
         p.moveTo(x, y);
-        GestureDescription.StrokeDescription s = new GestureDescription.StrokeDescription(p, 0, 55, false);
+        GestureDescription.StrokeDescription s = new GestureDescription.StrokeDescription(p, 0, 42, false);
         dispatchGesture(new GestureDescription.Builder().addStroke(s).build(), null, null);
     }
 
     private void dispatchLongPress(float x, float y) {
         Path p = new Path();
         p.moveTo(x, y);
-        GestureDescription.StrokeDescription s = new GestureDescription.StrokeDescription(p, 0, 560, false);
+        GestureDescription.StrokeDescription s = new GestureDescription.StrokeDescription(p, 0, 520, false);
         dispatchGesture(new GestureDescription.Builder().addStroke(s).build(), null, null);
     }
 
@@ -234,20 +223,17 @@ public class HandMouseAccessibilityService extends AccessibilityService implemen
         dragActive = true;
         strokeEndX = desiredDragX = cursorX;
         strokeEndY = desiredDragY = cursorY;
+
         Path p = new Path();
         p.moveTo(strokeEndX, strokeEndY);
-        long initialHold = "right".equals(mode) ? 520L : 40L;
+        long initialHold = "right".equals(mode) ? 510L : 32L;
         stroke = new GestureDescription.StrokeDescription(p, 0, initialHold, true);
         dispatchDragSegment(stroke);
     }
 
     private void endDrag() {
-        if (!dragActive) {
-            clearStrokeState();
-            return;
-        }
+        if (!dragActive) { clearStrokeState(); return; }
         dragActive = false;
-        // If the current segment is running, callback will finish it with willContinue=false.
         if (!segmentRunning) dispatchFinalDragSegment();
     }
 
@@ -257,7 +243,7 @@ public class HandMouseAccessibilityService extends AccessibilityService implemen
         p.moveTo(strokeEndX, strokeEndY);
         p.lineTo(desiredDragX, desiredDragY);
         try {
-            stroke = stroke.continueStroke(p, 0, 34L, true);
+            stroke = stroke.continueStroke(p, 0, 28L, true);
             strokeEndX = desiredDragX;
             strokeEndY = desiredDragY;
             dispatchDragSegment(stroke);
@@ -272,7 +258,7 @@ public class HandMouseAccessibilityService extends AccessibilityService implemen
         p.moveTo(strokeEndX, strokeEndY);
         p.lineTo(desiredDragX, desiredDragY);
         try {
-            stroke = stroke.continueStroke(p, 0, 12L, false);
+            stroke = stroke.continueStroke(p, 0, 8L, false);
             strokeEndX = desiredDragX;
             strokeEndY = desiredDragY;
             dispatchDragSegment(stroke);
@@ -305,11 +291,83 @@ public class HandMouseAccessibilityService extends AccessibilityService implemen
         }
     }
 
+    private void applyAimAssist() {
+        long now = SystemClock.uptimeMillis();
+        if (!assistValid || now - lastAssistScanMs >= ASSIST_SCAN_INTERVAL_MS) {
+            float[] p = findNearestClickableCenter(cursorX, cursorY, dpFloat(ASSIST_RADIUS_DP));
+            lastAssistScanMs = now;
+            if (p != null) {
+                assistX = p[0]; assistY = p[1]; assistValid = true;
+            } else assistValid = false;
+        }
+
+        if (!assistValid) return;
+        float d = (float)Math.hypot(assistX - cursorX, assistY - cursorY);
+        float max = dpFloat(ASSIST_RADIUS_DP);
+        if (d > max) { assistValid = false; return; }
+
+        float strength;
+        if (d <= dpFloat(ASSIST_STRONG_RADIUS_DP)) strength = 0.72f;
+        else strength = 0.24f * (1f - d / max) + 0.10f;
+        cursorX += (assistX - cursorX) * strength;
+        cursorY += (assistY - cursorY) * strength;
+    }
+
+    private float[] findNearestClickableCenter(float x, float y, float radiusPx) {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return null;
+        BestNode best = new BestNode(radiusPx);
+        scanClickable(root, x, y, best);
+        if (!best.found) return null;
+        return new float[]{best.x, best.y};
+    }
+
+    private boolean clickNearestClickable(float x, float y, float radiusPx) {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return false;
+        BestNode best = new BestNode(radiusPx);
+        scanClickable(root, x, y, best);
+        return best.node != null && best.node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+    }
+
+    private void scanClickable(AccessibilityNodeInfo node, float x, float y, BestNode best) {
+        if (node == null || !node.isVisibleToUser()) return;
+
+        if (node.isClickable() && node.isEnabled()) {
+            Rect r = new Rect();
+            node.getBoundsInScreen(r);
+            if (!r.isEmpty()) {
+                float cx = r.exactCenterX();
+                float cy = r.exactCenterY();
+                float d = (float)Math.hypot(cx - x, cy - y);
+                if (d < best.distance) {
+                    best.distance = d;
+                    best.x = cx;
+                    best.y = cy;
+                    best.node = node;
+                    best.found = true;
+                }
+            }
+        }
+
+        int count = node.getChildCount();
+        for (int i = 0; i < count; i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) scanClickable(child, x, y, best);
+        }
+    }
+
+    private static class BestNode {
+        float distance, x, y;
+        boolean found;
+        AccessibilityNodeInfo node;
+        BestNode(float radius) { distance = radius; }
+    }
+
     private void cancelGestureImmediately() {
         main.removeCallbacks(releaseRunnable);
         activeMode = "none";
         dragActive = false;
-        // Android doesn't expose a synchronous cancel; stopping continuation makes the next callback terminate it.
         if (!segmentRunning && stroke != null) dispatchFinalDragSegment();
         else if (stroke == null) clearStrokeState();
     }
