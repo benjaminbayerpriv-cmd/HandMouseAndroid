@@ -116,7 +116,7 @@ public class HandMouseAccessibilityService extends AccessibilityService {
             }
             if (cursor != null) {
                 cursor.setMode("none");
-                cursor.setVisibility(android.view.View.GONE);
+                cursor.setVisibility(android.view.View.VISIBLE);
             }
             try { stopForeground(STOP_FOREGROUND_REMOVE); } catch (Exception ignored) {}
         });
@@ -157,7 +157,7 @@ public class HandMouseAccessibilityService extends AccessibilityService {
         cursorParams.x = Math.round(cursorX);
         cursorParams.y = Math.round(cursorY);
         wm.addView(cursor, cursorParams);
-        cursor.setVisibility(android.view.View.GONE);
+        cursor.setVisibility(android.view.View.VISIBLE);
     }
 
     @SuppressWarnings("deprecation")
