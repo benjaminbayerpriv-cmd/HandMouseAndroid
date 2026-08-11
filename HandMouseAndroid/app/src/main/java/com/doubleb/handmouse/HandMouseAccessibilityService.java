@@ -19,6 +19,7 @@ import android.webkit.PermissionRequest;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
+import android.webkit.WebViewClient;
 
 public class HandMouseAccessibilityService extends AccessibilityService {
     private static volatile HandMouseAccessibilityService instance;
@@ -39,8 +40,10 @@ public class HandMouseAccessibilityService extends AccessibilityService {
     private float cursorX;
     private float cursorY;
     private String gesture = "none";
+    private volatile String diagnosticStatus = "Bereit";
+    private volatile long lastFrameAt = 0L;
+    private volatile double lastFps = 0.0;
 
-    // Continued Accessibility gesture state.
     private GestureDescription.StrokeDescription stroke;
     private boolean strokeActive;
     private boolean strokeHeld;
@@ -62,6 +65,7 @@ public class HandMouseAccessibilityService extends AccessibilityService {
         instance = this;
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
         createCursorOverlay();
+        setDiagnosticStatus("Bedienungshilfe aktiv · Cursor bereit");
     }
 
     @Override
@@ -82,19 +86,41 @@ public class HandMouseAccessibilityService extends AccessibilityService {
         return tracking;
     }
 
+    public String getDiagnosticStatus() {
+        return diagnosticStatus;
+    }
+
+    public double getLastFps() {
+        return lastFps;
+    }
+
+    private void setDiagnosticStatus(String text) {
+        diagnosticStatus = text == null ? "" : text;
+        android.util.Log.d("HandMouse", diagnosticStatus);
+    }
+
     public void startTracking() {
         main.post(() -> {
             if (tracking) return;
-            if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return;
+            if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                setDiagnosticStatus("KAMERA FEHLER · Android-Berechtigung fehlt");
+                return;
+            }
             try {
+                if (cursor != null) cursor.setVisibility(android.view.View.VISIBLE);
+                setDiagnosticStatus("Starte Foreground-Service…");
                 startAsForeground();
+
+                setDiagnosticStatus("Starte localhost 127.0.0.1:" + LocalAssetServer.PORT + "…");
                 assetServer = new LocalAssetServer(this);
                 assetServer.start();
+                setDiagnosticStatus("Server: OK · starte WebView…");
+
                 createTrackerWebView();
                 tracking = true;
-                if (cursor != null) cursor.setVisibility(android.view.View.VISIBLE);
             } catch (Exception e) {
                 e.printStackTrace();
+                setDiagnosticStatus("START FEHLER · " + e.getClass().getSimpleName() + ": " + e.getMessage());
                 stopTracking();
             }
         });
@@ -119,6 +145,7 @@ public class HandMouseAccessibilityService extends AccessibilityService {
                 cursor.setVisibility(android.view.View.VISIBLE);
             }
             try { stopForeground(STOP_FOREGROUND_REMOVE); } catch (Exception ignored) {}
+            setDiagnosticStatus("Tracking aus · Cursor bleibt sichtbar");
         });
     }
 
@@ -169,23 +196,54 @@ public class HandMouseAccessibilityService extends AccessibilityService {
         s.setMediaPlaybackRequiresUserGesture(false);
         s.setAllowFileAccess(true);
         s.setAllowContentAccess(true);
+
         trackerWebView.setBackgroundColor(android.graphics.Color.TRANSPARENT);
         trackerWebView.addJavascriptInterface(new JsBridge(), "AndroidBridge");
+
+        trackerWebView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                setDiagnosticStatus("WebView lädt · " + url);
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                setDiagnosticStatus("WebView: OK · HTML geladen");
+            }
+
+            @Override
+            public void onReceivedError(WebView view, android.webkit.WebResourceRequest request,
+                                        android.webkit.WebResourceError error) {
+                if (request != null && request.isForMainFrame()) {
+                    setDiagnosticStatus("WEBVIEW FEHLER · " + error.getErrorCode() + " · " + error.getDescription());
+                }
+            }
+        });
+
         trackerWebView.setWebChromeClient(new WebChromeClient() {
             @Override
             public void onPermissionRequest(PermissionRequest request) {
                 main.post(() -> {
+                    setDiagnosticStatus("WebView fragt Kamera an…");
                     if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
                         request.grant(new String[]{PermissionRequest.RESOURCE_VIDEO_CAPTURE});
                     } else {
                         request.deny();
+                        setDiagnosticStatus("KAMERA FEHLER · WebView-Berechtigung abgelehnt");
                     }
                 });
+            }
+
+            @Override
+            public boolean onConsoleMessage(android.webkit.ConsoleMessage consoleMessage) {
+                android.util.Log.d("HandMouseJS",
+                        consoleMessage.message() + " @" + consoleMessage.lineNumber());
+                return true;
             }
         });
 
         trackerParams = new WindowManager.LayoutParams(
-                dp(4), dp(4),
+                dp(8), dp(8),
                 WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
                         WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
@@ -194,7 +252,8 @@ public class HandMouseAccessibilityService extends AccessibilityService {
         trackerParams.gravity = Gravity.TOP | Gravity.LEFT;
         trackerParams.x = 0;
         trackerParams.y = 0;
-        trackerParams.alpha = 0.02f;
+        trackerParams.alpha = 0.03f;
+
         wm.addView(trackerWebView, trackerParams);
         trackerWebView.loadUrl("http://127.0.0.1:" + LocalAssetServer.PORT + "/hand-skeleton.html");
     }
@@ -202,12 +261,21 @@ public class HandMouseAccessibilityService extends AccessibilityService {
     private class JsBridge {
         @JavascriptInterface
         public void onFrame(double x, double y, String g) {
+            lastFrameAt = android.os.SystemClock.elapsedRealtime();
             main.post(() -> handleFrame((float)x, (float)y, g));
         }
 
         @JavascriptInterface
         public void onStatus(String text) {
-            android.util.Log.d("HandMouse", text == null ? "" : text);
+            setDiagnosticStatus(text);
+        }
+
+        @JavascriptInterface
+        public void onFps(double fps) {
+            lastFps = fps;
+            if (fps > 0) {
+                setDiagnosticStatus(String.format(java.util.Locale.US, "TRACKING OK · %.1f FPS", fps));
+            }
         }
     }
 
@@ -225,9 +293,8 @@ public class HandMouseAccessibilityService extends AccessibilityService {
             moveCursorOverlay();
         }
 
-        cursor.setMode(g);
+        if (cursor != null) cursor.setMode(g);
 
-        // Fist freezes pointer and safely releases any touch currently held.
         if ("fist".equals(g) || "none".equals(g)) {
             if (!"none".equals(gesture)) endStroke();
             gesture = g;
@@ -281,7 +348,6 @@ public class HandMouseAccessibilityService extends AccessibilityService {
             return;
         }
         strokeHeld = false;
-        // Current segment must finish before a non-continuing segment can be dispatched.
         if (!segmentRunning) dispatchNextSegment();
     }
 

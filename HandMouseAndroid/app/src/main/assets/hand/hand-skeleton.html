@@ -3,10 +3,10 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-  <title>Hand Mouse Tracker</title>
+  <title>Hand Mouse Tracker Diagnostics</title>
   <style>
     html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000}
-    video{position:absolute;width:2px;height:2px;opacity:.01;pointer-events:none}
+    video{position:absolute;width:8px;height:8px;opacity:.02;pointer-events:none}
   </style>
 </head>
 <body>
@@ -23,10 +23,29 @@ const PINCH_ON=.32;
 const PINCH_OFF=.42;
 const SMOOTHING=.34;
 
-function status(s){try{window.AndroidBridge?.onStatus(String(s));}catch(e){}}
+let fpsFrames=0;
+let fpsStart=performance.now();
+
+function status(s){
+  console.log("[HandMouse]",s);
+  try{window.AndroidBridge?.onStatus(String(s));}catch(e){}
+}
+function fpsTick(){
+  fpsFrames++;
+  const now=performance.now();
+  if(now-fpsStart>=1000){
+    const fps=fpsFrames*1000/(now-fpsStart);
+    try{window.AndroidBridge?.onFps(fps);}catch(e){}
+    fpsFrames=0;
+    fpsStart=now;
+  }
+}
 function send(x,y,g){try{window.AndroidBridge?.onFrame(x,y,g);}catch(e){}}
 function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y);}
 function handScale(lm){return Math.max(dist(lm[5],lm[17]),dist(lm[0],lm[9]),.05);}
+
+window.addEventListener('error',e=>status('JS ERROR · '+(e.message||e.error||'unknown')));
+window.addEventListener('unhandledrejection',e=>status('PROMISE ERROR · '+String(e.reason)));
 
 function angleDeg(a,b,c){
   const ab={x:a.x-b.x,y:a.y-b.y,z:(a.z||0)-(b.z||0)};
@@ -82,7 +101,6 @@ function getGesture(lm){
   const ti=dist(lm[4],lm[8])/scale;
   const tm=dist(lm[4],lm[12])/scale;
   const threshold=currentGesture==='none'?PINCH_ON:PINCH_OFF;
-  // Rechts-Geste: Daumen + Mittelfinger, Zeigefinger ausdrücklich getrennt.
   if(tm<threshold && ti>threshold*1.35)return 'right';
   if(ti<threshold)return 'left';
   return 'none';
@@ -106,43 +124,95 @@ function updateMouse(lm){
 }
 
 async function createLandmarker(delegate){
+  status('WASM wird geladen…');
   const vision=await FilesetResolver.forVisionTasks('./mediapipe/wasm');
+  status('WASM: OK · lade Hand-Modell…');
   const opts={
     baseOptions:{modelAssetPath:'./mediapipe/hand_landmarker.task'},
-    runningMode:'VIDEO',numHands:1,
-    minHandDetectionConfidence:.55,minHandPresenceConfidence:.55,minTrackingConfidence:.55
+    runningMode:'VIDEO',
+    numHands:1,
+    minHandDetectionConfidence:.55,
+    minHandPresenceConfidence:.55,
+    minTrackingConfidence:.55
   };
   if(delegate)opts.baseOptions.delegate=delegate;
   return await HandLandmarker.createFromOptions(vision,opts);
 }
 
 async function init(){
-  status('Lade MediaPipe');
-  try{handLandmarker=await createLandmarker('GPU');}
-  catch(e){status('GPU Fallback: '+e);handLandmarker=await createLandmarker(null);}
-  status('MediaPipe bereit');
-  const stream=await navigator.mediaDevices.getUserMedia({
-    video:{facingMode:'user',width:{ideal:640},height:{ideal:480},frameRate:{ideal:30,max:30}},
-    audio:false
-  });
+  status('JS: OK · Initialisierung gestartet');
+
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    throw new Error('getUserMedia ist in diesem WebView nicht verfügbar');
+  }
+
+  try{
+    status('MediaPipe GPU wird gestartet…');
+    handLandmarker=await createLandmarker('GPU');
+    status('MediaPipe: OK · GPU');
+  }catch(e){
+    status('GPU FEHLER · '+String(e)+' · versuche CPU…');
+    handLandmarker=await createLandmarker(null);
+    status('MediaPipe: OK · CPU fallback');
+  }
+
+  status('Kamera wird angefordert…');
+
+  let stream;
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({
+      video:{
+        facingMode:'user',
+        width:{ideal:640},
+        height:{ideal:480},
+        frameRate:{ideal:30,max:30}
+      },
+      audio:false
+    });
+  }catch(e){
+    status('KAMERA FEHLER · '+(e?.name||'Error')+' · '+(e?.message||String(e)));
+    throw e;
+  }
+
+  status('Kamera-Stream erhalten · starte Video…');
   video.srcObject=stream;
-  await video.play();
-  status('Kamera aktiv');
+
+  try{
+    await video.play();
+  }catch(e){
+    status('VIDEO PLAY FEHLER · '+(e?.name||'Error')+' · '+(e?.message||String(e)));
+    throw e;
+  }
+
+  const track=stream.getVideoTracks()[0];
+  const settings=track?.getSettings?.()||{};
+  status('Kamera: OK · '+(settings.width||'?')+'×'+(settings.height||'?')+' · '+(settings.frameRate||'?')+' FPS Quelle');
+
   requestAnimationFrame(processFrame);
 }
 
 function processFrame(now){
+  fpsTick();
+
   if(video.readyState>=2 && handLandmarker){
     try{
       const result=handLandmarker.detectForVideo(video,now);
       if(result.landmarks.length) updateMouse(result.landmarks[0]);
-      else { currentGesture='none'; send(smoothX,smoothY,'none'); }
-    }catch(e){status('Framefehler: '+e);}
+      else {
+        currentGesture='none';
+        send(smoothX,smoothY,'none');
+      }
+    }catch(e){
+      status('FRAME FEHLER · '+(e?.message||String(e)));
+    }
   }
+
   requestAnimationFrame(processFrame);
 }
 
-init().catch(e=>status('INIT ERROR: '+e));
+init().catch(e=>{
+  status('INIT FEHLER · '+(e?.name||'Error')+' · '+(e?.message||String(e)));
+});
 </script>
 </body>
 </html>
